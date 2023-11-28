@@ -15,3 +15,4 @@ if [ -z "$PASSIVE" ]; then
 fi
 
 export STAGING_ROOT="/data/safe_staging"
+export FINGERPRINT="KIA SPORTAGE HYBRID 5TH GEN"
