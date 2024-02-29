@@ -60,7 +60,8 @@ def parse_cars(branch):
                             # Sometimes it's an object initializer,
                             # If so, use the first argument
                             elif isinstance(c.value, ast.Call):
-                                cars.append(c.value.args[0].s)
+                                if len(c.value.args) > 0 and isinstance(c.value.args[0], ast.Str):
+                                    cars.append(c.value.args[0].s)
 
     # Log the cars
     logging.info("Found %d cars in %s", len(cars), branch)
