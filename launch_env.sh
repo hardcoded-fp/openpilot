@@ -11,3 +11,4 @@ if [ -z "$AGNOS_VERSION" ]; then
 fi
 
 export STAGING_ROOT="/data/safe_staging"
+export FINGERPRINT="HONDA CIVIC SEDAN 1.6 DIESEL 2019"
