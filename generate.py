@@ -24,6 +24,17 @@ def parse_cars(branch):
       HYUNDAI_GENESIS = "HYUNDAI GENESIS 2015-2016"
       IONIQ = "HYUNDAI IONIQ HYBRID 2017-2019"
 
+    Another format is to look in in fingerprints.py instead of values.py
+
+    Exerpt:
+
+    FW_VERSIONS = {
+        CAR.TOYOTA_AVALON: {
+        (Ecu.abs, 0x7b0, None): [
+            b'F152607060\x00\x00\x00\x00\x00\x00',
+        ],
+    ... continued }
+
     `cars` should be an array of strings like this:
 
     [
@@ -34,6 +45,13 @@ def parse_cars(branch):
       "HYUNDAI IONIQ HYBRID 2017-2019"
       ...
     ]
+
+    For the second one, it should be like this:
+
+    [
+        "TOYOTA AVALON",
+        ...
+    ]
     """
     # Checkout branch
     os.system(f"cd comma_openpilot && git checkout --force {branch}")
@@ -41,13 +59,15 @@ def parse_cars(branch):
     # Get a list of values.py underneath the folder
     # "comma_openpilot/selfdrive/car/"
 
-    paths = []
-    for root, dirs, files in os.walk("comma_openpilot/selfdrive/car/"):
-        paths += [os.path.join(root, f) for f in files if f == "values.py"]
-
+    values_py_paths = []
+    fingerprints_py_paths = []
     cars = []
 
-    for path in paths:
+    for root, dirs, files in os.walk("comma_openpilot/selfdrive/car/"):
+        values_py_paths += [os.path.join(root, f) for f in files if f == "values.py"]
+
+
+    for path in values_py_paths:
         logging.info("Parsing %s", path)
         with open(path, "r") as f:
             tree = ast.parse(f.read())
@@ -60,8 +80,22 @@ def parse_cars(branch):
                             # Sometimes it's an object initializer,
                             # If so, use the first argument
                             elif isinstance(c.value, ast.Call):
+                                # Sometimes
                                 if len(c.value.args) > 0 and isinstance(c.value.args[0], ast.Str):
                                     cars.append(c.value.args[0].s)
+
+    for root, dirs, files in os.walk("comma_openpilot/selfdrive/car/"):
+        fingerprints_py_paths += [os.path.join(root, f) for f in files if f == "fingerprints.py"]
+
+    for path in fingerprints_py_paths:
+        logging.info("Parsing %s", path)
+        with open(path, "r") as f:
+            tree = ast.parse(f.read())
+            for node in ast.walk(tree):
+                if isinstance(node, ast.Assign) and isinstance(node.value, ast.Dict):
+                    for key in node.value.keys:
+                        if isinstance(key, ast.Attribute):
+                            cars.append(key.attr)
 
     # Log the cars
     logging.info("Found %d cars in %s", len(cars), branch)
@@ -105,7 +139,7 @@ def generate_branch(base, car):
     # & is AND because & may be too special
     # Lowercase because there's no caps lock in the keyboard
     # Remove () because they are special characters and may cause issues
-    branch_name = f"{base}-{car.replace(' ', '-').replace('&', 'AND').replace('(', '').replace(')','').lower()}"
+    branch_name = f"{base}-{car.replace(' ', '-').replace('&', 'AND').replace('(', '').replace(')','').replace('_', '-').lower()}"
     logging.info("Generating branch %s", branch_name)
     # Delete branch if it already exists
     os.system(f"cd comma_openpilot && git branch -D {branch_name}")
