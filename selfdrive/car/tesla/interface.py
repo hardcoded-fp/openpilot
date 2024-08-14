@@ -18,12 +18,7 @@ class CarInterface(CarInterfaceBase):
 
     ret.steerControlType = car.CarParams.SteerControlType.angle
 
-    # Set kP and kI to 0 over the whole speed range to have the planner accel as actuator command
-    ret.longitudinalTuning.kpBP = [0]
-    ret.longitudinalTuning.kpV = [0]
-    ret.longitudinalTuning.kiBP = [0]
-    ret.longitudinalTuning.kiV = [0]
-    ret.longitudinalActuatorDelayUpperBound = 0.5 # s
+    ret.longitudinalActuatorDelay = 0.5 # s
     ret.radarTimeStep = (1.0 / 8) # 8Hz
 
     # Check if we have messages on an auxiliary panda, and that 0x2bf (DAS_control) is present on the AP powertrain bus
@@ -42,11 +37,4 @@ class CarInterface(CarInterfaceBase):
 
     ret.steerLimitTimer = 1.0
     ret.steerActuatorDelay = 0.25
-    return ret
-
-  def _update(self, c):
-    ret = self.CS.update(self.cp, self.cp_cam)
-
-    ret.events = self.create_common_events(ret).to_msg()
-
     return ret

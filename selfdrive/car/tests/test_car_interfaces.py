@@ -6,16 +6,17 @@ import importlib
 from parameterized import parameterized
 
 from cereal import car, messaging
-from openpilot.common.realtime import DT_CTRL
-from openpilot.selfdrive.car import gen_empty_fingerprint
+from openpilot.selfdrive.car import DT_CTRL, gen_empty_fingerprint
 from openpilot.selfdrive.car.car_helpers import interfaces
 from openpilot.selfdrive.car.fingerprints import all_known_cars
 from openpilot.selfdrive.car.fw_versions import FW_VERSIONS, FW_QUERY_CONFIGS
 from openpilot.selfdrive.car.interfaces import get_interface_attr
+from openpilot.selfdrive.car.mock.values import CAR as MOCK
 from openpilot.selfdrive.controls.lib.latcontrol_angle import LatControlAngle
 from openpilot.selfdrive.controls.lib.latcontrol_pid import LatControlPID
 from openpilot.selfdrive.controls.lib.latcontrol_torque import LatControlTorque
 from openpilot.selfdrive.controls.lib.longcontrol import LongControl
+from openpilot.selfdrive.pandad import can_capnp_to_list
 from openpilot.selfdrive.test.fuzzy_generation import DrawType, FuzzyGenerator
 
 ALL_ECUS = {ecu for ecus in FW_VERSIONS.values() for ecu in ecus.keys()}
@@ -23,7 +24,7 @@ ALL_ECUS |= {ecu for config in FW_QUERY_CONFIGS.values() for ecu in config.extra
 
 ALL_REQUESTS = {tuple(r.request) for config in FW_QUERY_CONFIGS.values() for r in config.requests}
 
-MAX_EXAMPLES = int(os.environ.get('MAX_EXAMPLES', '40'))
+MAX_EXAMPLES = int(os.environ.get('MAX_EXAMPLES', '60'))
 
 
 def get_fuzzy_car_interface_args(draw: DrawType) -> dict:
@@ -51,7 +52,7 @@ def get_fuzzy_car_interface_args(draw: DrawType) -> dict:
 class TestCarInterfaces:
   # FIXME: Due to the lists used in carParams, Phase.target is very slow and will cause
   #  many generated examples to overrun when max_examples > ~20, don't use it
-  @parameterized.expand([(car,) for car in sorted(all_known_cars())])
+  @parameterized.expand([(car,) for car in sorted(all_known_cars())] + [MOCK.MOCK])
   @settings(max_examples=MAX_EXAMPLES, deadline=None,
             phases=(Phase.reuse, Phase.generate, Phase.shrink))
   @given(data=st.data())
@@ -62,6 +63,7 @@ class TestCarInterfaces:
 
     car_params = CarInterface.get_params(car_name, args['fingerprints'], args['car_fw'],
                                          experimental_long=args['experimental_long'], docs=False)
+    car_params = car_params.as_reader()
     car_interface = CarInterface(car_params, CarController, CarState)
     assert car_params
     assert car_interface
@@ -75,15 +77,15 @@ class TestCarInterfaces:
     # Longitudinal sanity checks
     assert len(car_params.longitudinalTuning.kpV) == len(car_params.longitudinalTuning.kpBP)
     assert len(car_params.longitudinalTuning.kiV) == len(car_params.longitudinalTuning.kiBP)
-    assert len(car_params.longitudinalTuning.deadzoneV) == len(car_params.longitudinalTuning.deadzoneBP)
 
     # Lateral sanity checks
     if car_params.steerControlType != car.CarParams.SteerControlType.angle:
       tune = car_params.lateralTuning
       if tune.which() == 'pid':
-        assert not math.isnan(tune.pid.kf) and tune.pid.kf > 0
-        assert len(tune.pid.kpV) > 0 and len(tune.pid.kpV) == len(tune.pid.kpBP)
-        assert len(tune.pid.kiV) > 0 and len(tune.pid.kiV) == len(tune.pid.kiBP)
+        if car_name != MOCK.MOCK:
+          assert not math.isnan(tune.pid.kf) and tune.pid.kf > 0
+          assert len(tune.pid.kpV) > 0 and len(tune.pid.kpV) == len(tune.pid.kpBP)
+          assert len(tune.pid.kiV) > 0 and len(tune.pid.kiV) == len(tune.pid.kiBP)
 
       elif tune.which() == 'torque':
         assert not math.isnan(tune.torque.kf) and tune.torque.kf > 0
@@ -94,14 +96,14 @@ class TestCarInterfaces:
     now_nanos = 0
     CC = car.CarControl.new_message(**cc_msg)
     for _ in range(10):
-      car_interface.update(CC, [])
+      car_interface.update([])
       car_interface.apply(CC.as_reader(), now_nanos)
       now_nanos += DT_CTRL * 1e9  # 10 ms
 
     CC = car.CarControl.new_message(**cc_msg)
     CC.enabled = True
     for _ in range(10):
-      car_interface.update(CC, [])
+      car_interface.update([])
       car_interface.apply(CC.as_reader(), now_nanos)
       now_nanos += DT_CTRL * 1e9  # 10ms
 
@@ -129,7 +131,7 @@ class TestCarInterfaces:
 
     # Test radar fault
     if not car_params.radarUnavailable and radar_interface.rcp is not None:
-      cans = [messaging.new_message('can', 1).to_bytes() for _ in range(5)]
+      cans = can_capnp_to_list([messaging.new_message('can', 1).to_bytes() for _ in range(5)])
       rr = radar_interface.update(cans)
       assert rr is None or len(rr.errors) > 0
 
