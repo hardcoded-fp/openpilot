@@ -66,6 +66,8 @@ def parse_cars(branch):
     for root, dirs, files in os.walk("comma_openpilot/selfdrive/car/"):
         values_py_paths += [os.path.join(root, f) for f in files if f == "values.py"]
 
+    for root, dirs, files in os.walk("comma_openpilot/opendbc/car/"):
+        values_py_paths += [os.path.join(root, f) for f in files if f == "values.py"]
 
     for path in values_py_paths:
         logging.info("Parsing %s", path)
@@ -77,6 +79,9 @@ def parse_cars(branch):
                         if isinstance(c, ast.Assign):
                             if isinstance(c.value, ast.Str):
                                 cars.append(c.value.s)
+                            elif isinstance(c.targets[0], ast.Name):
+                                # opendbc has most of the cars refactor
+                                cars.append(c.targets[0].id)
                             # Sometimes it's an object initializer,
                             # If so, use the first argument
                             elif isinstance(c.value, ast.Call):
