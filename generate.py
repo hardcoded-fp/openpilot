@@ -5,16 +5,78 @@ import datetime
 import logging
 import os
 import pprint
+import shlex
+import subprocess
 
 logging.basicConfig(level=logging.INFO, format="%(message)s")
 
+OPENPILOT_REPO_URL = "https://github.com/commaai/openpilot.git"
+SUPPORTED_BASE_BRANCHES = ("nightly", "nightly-dev", "release-mici", "release-tizi")
+UPSTREAM_BRANCH_CANDIDATES = {
+    "nightly": ("nightly",),
+    "nightly-dev": ("nightly-dev",),
+    "release-mici": ("release-mici",),
+    "release-tizi": ("release-tizi",),
+}
 
-def parse_cars(branch):
+
+def run(cmd, check=True):
+    logging.info("+ %s", cmd)
+    return subprocess.run(cmd, shell=True, check=check)
+
+
+def capture(cmd):
+    logging.info("+ %s", cmd)
+    return subprocess.check_output(cmd, shell=True, text=True).strip()
+
+
+def get_available_upstream_branches():
+    refs = capture(f"git ls-remote --heads {OPENPILOT_REPO_URL}")
+    branches = set()
+    for line in refs.splitlines():
+        _, ref = line.split("\t", 1)
+        branches.add(ref.removeprefix("refs/heads/"))
+    return branches
+
+
+def get_string_literal(node):
+    if isinstance(node, ast.Constant) and isinstance(node.value, str):
+        return node.value
+    return None
+
+
+def resolve_base_branches():
+    available_branches = get_available_upstream_branches()
+    resolved = {}
+    skipped = []
+    for public_branch in SUPPORTED_BASE_BRANCHES:
+        for candidate in UPSTREAM_BRANCH_CANDIDATES[public_branch]:
+            if candidate in available_branches:
+                resolved[public_branch] = candidate
+                break
+        if public_branch not in resolved:
+            skipped.append(public_branch)
+
+    if not resolved:
+        raise RuntimeError(
+            "Failed to resolve any supported upstream branches. "
+            + f". Available branches: {', '.join(sorted(available_branches))}"
+        )
+
+    logging.info("Resolved base branches: %s", pprint.pformat(resolved))
+    if skipped:
+        logging.info("Skipping unavailable branches: %s", ", ".join(skipped))
+    return resolved
+
+
+def parse_cars(upstream_branch):
     """
-    Parse the file with ast for a class named "CAR" and get a list of all the cars.
-    We are looking for the values in quotes.
+    Parse car names from the current upstream opendbc layout.
 
-    Exerpt:
+    We read the `CAR` class values from `values.py` and fall back to
+    `fingerprints.py` keys for branches that still define models there.
+
+    Example:
 
     class CAR:
       # Hyundai
@@ -24,9 +86,9 @@ def parse_cars(branch):
       HYUNDAI_GENESIS = "HYUNDAI GENESIS 2015-2016"
       IONIQ = "HYUNDAI IONIQ HYBRID 2017-2019"
 
-    Another format is to look in in fingerprints.py instead of values.py
+    Another format is to look in `fingerprints.py` instead of `values.py`.
 
-    Exerpt:
+    Example:
 
     FW_VERSIONS = {
         CAR.TOYOTA_AVALON: {
@@ -54,20 +116,16 @@ def parse_cars(branch):
     ]
     """
     # Checkout branch
-    os.system(f"cd comma_openpilot && git checkout --force {branch}")
+    run(f"cd comma_openpilot && git checkout --force origin/{upstream_branch}")
 
-    # Get a list of values.py underneath the folder
-    # "comma_openpilot/selfdrive/car/"
-
+    car_root = "comma_openpilot/opendbc/car"
     values_py_paths = []
     fingerprints_py_paths = []
     cars = []
 
-    for root, dirs, files in os.walk("comma_openpilot/selfdrive/car/"):
+    for root, dirs, files in os.walk(car_root):
         values_py_paths += [os.path.join(root, f) for f in files if f == "values.py"]
-
-    for root, dirs, files in os.walk("comma_openpilot/opendbc/car/"):
-        values_py_paths += [os.path.join(root, f) for f in files if f == "values.py"]
+        fingerprints_py_paths += [os.path.join(root, f) for f in files if f == "fingerprints.py"]
 
     for path in values_py_paths:
         logging.info("Parsing %s", path)
@@ -77,8 +135,9 @@ def parse_cars(branch):
                 if isinstance(node, ast.ClassDef) and node.name == "CAR":
                     for c in node.body:
                         if isinstance(c, ast.Assign):
-                            if isinstance(c.value, ast.Str):
-                                cars.append(c.value.s)
+                            string_value = get_string_literal(c.value)
+                            if string_value is not None:
+                                cars.append(string_value)
                             elif isinstance(c.targets[0], ast.Name):
                                 # opendbc has most of the cars refactor
                                 cars.append(c.targets[0].id)
@@ -86,11 +145,10 @@ def parse_cars(branch):
                             # If so, use the first argument
                             elif isinstance(c.value, ast.Call):
                                 # Sometimes
-                                if len(c.value.args) > 0 and isinstance(c.value.args[0], ast.Str):
-                                    cars.append(c.value.args[0].s)
-
-    for root, dirs, files in os.walk("comma_openpilot/selfdrive/car/"):
-        fingerprints_py_paths += [os.path.join(root, f) for f in files if f == "fingerprints.py"]
+                                if len(c.value.args) > 0:
+                                    string_value = get_string_literal(c.value.args[0])
+                                    if string_value is not None:
+                                        cars.append(string_value)
 
     for path in fingerprints_py_paths:
         logging.info("Parsing %s", path)
@@ -102,40 +160,55 @@ def parse_cars(branch):
                         if isinstance(key, ast.Attribute):
                             cars.append(key.attr)
 
-    # Log the cars
-    logging.info("Found %d cars in %s", len(cars), branch)
+    cars = list(dict.fromkeys(cars))
+    logging.info("Found %d cars in %s", len(cars), upstream_branch)
 
     return cars
 
 
 def prepare_op_repo():
     """
-    Prepare the openpilot repo with master-ci and release3 branches
+    Prepare the openpilot repo and resolve the current upstream deployment branches.
     """
+    resolved_branches = resolve_base_branches()
+
     # Try to clone the repo to comma_openpilot.
     # If it fails, it means it already exists, so we can just pull
     # the latest changes.
     logging.info("Setting up openpilot repo. Ignore errors if it already exists.")
 
-    os.system(
-        "git clone -b master-ci https://github.com/commaai/openpilot.git comma_openpilot"
-    )
+    if not os.path.isdir("comma_openpilot/.git"):
+        run(
+            "git clone --filter=blob:none --no-checkout "
+            f"{OPENPILOT_REPO_URL} comma_openpilot"
+        )
     # Make sure that comma_openpilot is usiing that as the origin.
-    os.system(
-        "cd comma_openpilot && git remote set-url origin https://github.com/commaai/openpilot.git"
+    run(f"cd comma_openpilot && git remote set-url origin {OPENPILOT_REPO_URL}")
+    branch_refspecs = " ".join(
+        f"+refs/heads/{branch}:refs/remotes/origin/{branch}"
+        for branch in sorted(set(resolved_branches.values()))
     )
-    os.system("cd comma_openpilot && git fetch origin")
-    os.system(
-        "cd comma_openpilot && git checkout release3 && git reset --hard origin/release3"
-    )
-    os.system(
-        "cd comma_openpilot && git checkout master-ci && git reset --hard origin/master-ci"
+    run(
+        "cd comma_openpilot && git fetch --prune --depth 1 origin "
+        f"{branch_refspecs}"
     )
 
     logging.info("Done setting up openpilot repo.")
+    return resolved_branches
 
 
-def generate_branch(base, car):
+def sanitize_branch_component(car):
+    return (
+        car.replace(" ", "-")
+        .replace("&", "AND")
+        .replace("(", "")
+        .replace(")", "")
+        .replace("_", "-")
+        .lower()
+    )
+
+
+def generate_branch(base, upstream_branch, car):
     """
     Make a new branch for the car with a hardcoded fingerprint
     """
@@ -144,29 +217,37 @@ def generate_branch(base, car):
     # & is AND because & may be too special
     # Lowercase because there's no caps lock in the keyboard
     # Remove () because they are special characters and may cause issues
-    branch_name = f"{base}-{car.replace(' ', '-').replace('&', 'AND').replace('(', '').replace(')','').replace('_', '-').lower()}"
-    logging.info("Generating branch %s", branch_name)
+    branch_name = f"{base}-{sanitize_branch_component(car)}"
+    logging.info("Generating branch %s from origin/%s", branch_name, upstream_branch)
     # Delete branch if it already exists
-    os.system(f"cd comma_openpilot && git branch -D {branch_name}")
+    run(
+        f"cd comma_openpilot && git branch -D {shlex.quote(branch_name)}",
+        check=False,
+    )
     # Make branch off of base branch
-    os.system(
-        f"cd comma_openpilot && git checkout {base} && git checkout -b {branch_name}"
+    run(
+        "cd comma_openpilot && "
+        f"git checkout --force -B {shlex.quote(branch_name)} origin/{shlex.quote(upstream_branch)}"
     )
     # Make sure base branch is clean
-    os.system(f"cd comma_openpilot && git reset --hard origin/{base}")
+    run(
+        "cd comma_openpilot && "
+        f"git reset --hard origin/{shlex.quote(upstream_branch)}"
+    )
     # Append 'export FINGERPRINT="car name"' to the end of launch_env.sh
-    os.system(f"echo 'export FINGERPRINT=\"{car}\"' >> comma_openpilot/launch_env.sh")
+    with open("comma_openpilot/launch_env.sh", "a") as f:
+        f.write(f'\nexport FINGERPRINT="{car}"\n')
     # Commit the changes
     # Get date of current commit
-    commit_date = os.popen(
-        "cd comma_openpilot && git log -1 --format=%cd --date=iso-strict"
-    ).read()
-    author_date = os.popen(
-        "cd comma_openpilot && git log -1 --format=%ad --date=iso-strict"
-    ).read()
+    commit_date = capture("cd comma_openpilot && git log -1 --format=%cd --date=iso-strict")
+    author_date = capture("cd comma_openpilot && git log -1 --format=%ad --date=iso-strict")
 
-    os.system(
-        f"cd comma_openpilot && git add launch_env.sh && GIT_AUTHOR_DATE='{author_date}' GIT_COMMITTER_DATE='{commit_date}' git commit -m 'Hardcode fingerprint for {car}'"
+    run(
+        "cd comma_openpilot && "
+        "git add launch_env.sh && "
+        f"GIT_AUTHOR_DATE={shlex.quote(author_date)} "
+        f"GIT_COMMITTER_DATE={shlex.quote(commit_date)} "
+        f"git commit -m {shlex.quote(f'Hardcode fingerprint for {car}')}"
     )
     return branch_name
 
@@ -233,18 +314,18 @@ Please see the <a href="https://github.com/hardcoded-fp/openpilot/">README for g
 
 
 def main(push=True):
-    prepare_op_repo()
+    resolved_branches = prepare_op_repo()
+    base_branches = tuple(resolved_branches.keys())
 
     base_cars = {}
-    base_branches = ["master-ci", "nightly", "release3"]
     for base in base_branches:
-        base_cars[base] = parse_cars(base)
+        base_cars[base] = parse_cars(resolved_branches[base])
 
     base_cars_base_branches = {}
     for base in base_branches:
         base_cars_base_branches[base] = {}
         for car in base_cars[base]:
-            branch = generate_branch(base, car)
+            branch = generate_branch(base, resolved_branches[base], car)
             base_cars_base_branches[base][car] = branch
     logging.info("Done generating branches")
 
@@ -259,9 +340,9 @@ def main(push=True):
         # Run the command to push to origin all the branches
         # Copy .git/config from this git repo to comma_openpilot repo
         # This might make GitHub Actions work
-        os.system("cp .git/config comma_openpilot/.git/config")
+        run("cp .git/config comma_openpilot/.git/config")
         logging.info("Pushing branches to origin")
-        os.system("cd comma_openpilot && git push origin --force --all")
+        run("cd comma_openpilot && git push origin --force --all")
 
 
 if __name__ == "__main__":
