@@ -380,6 +380,20 @@ applyFilter();
         f.write(header + body + footer)
 
 
+def push_generated_branches(base_cars_base_branches):
+    branch_names = []
+    for branches_by_car in base_cars_base_branches.values():
+        branch_names.extend(branches_by_car.values())
+
+    unique_branch_names = sorted(set(branch_names))
+    for branch_name in unique_branch_names:
+        logging.info("Pushing branch %s", branch_name)
+        run(
+            "cd comma_openpilot && "
+            f"git push origin --force {shlex.quote(branch_name)}:{shlex.quote(branch_name)}"
+        )
+
+
 def main(push=True):
     resolved_branches = prepare_op_repo()
     base_branches = tuple(resolved_branches.keys())
@@ -409,7 +423,7 @@ def main(push=True):
         # This might make GitHub Actions work
         run("cp .git/config comma_openpilot/.git/config")
         logging.info("Pushing branches to origin")
-        run("cd comma_openpilot && git push origin --force --all")
+        push_generated_branches(base_cars_base_branches)
 
 
 if __name__ == "__main__":
