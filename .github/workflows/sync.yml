@@ -15,7 +15,7 @@ jobs:
     permissions:
       contents: write
     steps:
-      - uses: actions/checkout@v3
+      - uses: actions/checkout@v6
       - name: Be GitHub Actions Bot for Git
         run: |
           git config --global user.email "41898282+github-actions[bot]@users.noreply.github.com"
@@ -25,7 +25,7 @@ jobs:
         run: |
           python3 generate.py --no-dry-run
       - name: Upload Pages artifact
-        uses: actions/upload-pages-artifact@v2
+        uses: actions/upload-pages-artifact@v3
         with:
           path: pages
   deploy-pages:
@@ -47,4 +47,4 @@ jobs:
     steps:
       - name: Deploy to GitHub Pages
         id: deployment
-        uses: actions/deploy-pages@v2 # or the latest "vX.X.X" version tag for this action
+        uses: actions/deploy-pages@v4
