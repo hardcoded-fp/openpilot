@@ -8,6 +8,7 @@ import os
 import pprint
 import shlex
 import subprocess
+import time
 
 logging.basicConfig(level=logging.INFO, format="%(message)s")
 
@@ -19,6 +20,24 @@ UPSTREAM_BRANCH_CANDIDATES = {
     "release-mici": ("release-mici",),
     "release-tizi": ("release-tizi",),
 }
+TRANSIENT_GIT_ERROR_MARKERS = (
+    "The requested URL returned error: 500",
+    "The requested URL returned error: 502",
+    "The requested URL returned error: 503",
+    "The requested URL returned error: 504",
+    "Internal Server Error",
+    "remote end hung up unexpectedly",
+    "Connection reset",
+    "Connection timed out",
+    "Failed to connect",
+    "Operation timed out",
+    "TLS connection was non-properly terminated",
+    "Could not resolve host",
+    "early EOF",
+    "RPC failed",
+)
+PUSH_RETRY_ATTEMPTS = 5
+PUSH_RETRY_BASE_DELAY_SECONDS = 10
 
 
 def run(cmd, check=True):
@@ -29,6 +48,70 @@ def run(cmd, check=True):
 def capture(cmd):
     logging.info("+ %s", cmd)
     return subprocess.check_output(cmd, shell=True, text=True).strip()
+
+
+def run_for_output(cmd, check=True):
+    logging.info("+ %s", cmd)
+    process = subprocess.run(
+        cmd,
+        shell=True,
+        check=False,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+    )
+    if process.stdout:
+        logging.info(process.stdout.rstrip())
+    if check and process.returncode != 0:
+        raise subprocess.CalledProcessError(
+            process.returncode, process.args, output=process.stdout
+        )
+    return process
+
+
+def local_branch_exists(branch_name):
+    ref = f"refs/heads/{branch_name}"
+    process = subprocess.run(
+        "cd comma_openpilot && "
+        f"git show-ref --verify --quiet {shlex.quote(ref)}",
+        shell=True,
+        check=False,
+    )
+    return process.returncode == 0
+
+
+def is_transient_git_error(output):
+    normalized_output = output.lower()
+    return any(
+        marker.lower() in normalized_output for marker in TRANSIENT_GIT_ERROR_MARKERS
+    )
+
+
+def push_branch_with_retries(branch_name):
+    push_cmd = (
+        "cd comma_openpilot && "
+        f"git push origin --force {shlex.quote(branch_name)}:{shlex.quote(branch_name)}"
+    )
+    for attempt in range(1, PUSH_RETRY_ATTEMPTS + 1):
+        process = run_for_output(push_cmd, check=False)
+        if process.returncode == 0:
+            return
+
+        output = process.stdout or ""
+        if not is_transient_git_error(output) or attempt == PUSH_RETRY_ATTEMPTS:
+            raise subprocess.CalledProcessError(
+                process.returncode, process.args, output=output
+            )
+
+        delay = PUSH_RETRY_BASE_DELAY_SECONDS * attempt
+        logging.warning(
+            "Push failed with a transient GitHub error. "
+            "Retrying in %s seconds (%s/%s).",
+            delay,
+            attempt + 1,
+            PUSH_RETRY_ATTEMPTS,
+        )
+        time.sleep(delay)
 
 
 def get_available_upstream_branches():
@@ -220,11 +303,8 @@ def generate_branch(base, upstream_branch, car):
     # Remove () because they are special characters and may cause issues
     branch_name = f"{base}-{sanitize_branch_component(car)}"
     logging.info("Generating branch %s from origin/%s", branch_name, upstream_branch)
-    # Delete branch if it already exists
-    run(
-        f"cd comma_openpilot && git branch -D {shlex.quote(branch_name)}",
-        check=False,
-    )
+    if local_branch_exists(branch_name):
+        run(f"cd comma_openpilot && git branch -D {shlex.quote(branch_name)}")
     # Make branch off of base branch
     run(
         "cd comma_openpilot && "
@@ -388,10 +468,7 @@ def push_generated_branches(base_cars_base_branches):
     unique_branch_names = sorted(set(branch_names))
     for branch_name in unique_branch_names:
         logging.info("Pushing branch %s", branch_name)
-        run(
-            "cd comma_openpilot && "
-            f"git push origin --force {shlex.quote(branch_name)}:{shlex.quote(branch_name)}"
-        )
+        push_branch_with_retries(branch_name)
 
 
 def main(push=True):
