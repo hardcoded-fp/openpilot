@@ -8,6 +8,7 @@ import os
 import pprint
 import shlex
 import subprocess
+import tempfile
 import time
 
 logging.basicConfig(level=logging.INFO, format="%(message)s")
@@ -42,6 +43,7 @@ TRANSIENT_GIT_RETURN_CODES = (
 )
 PUSH_RETRY_ATTEMPTS = 5
 PUSH_RETRY_BASE_DELAY_SECONDS = 10
+BRANCH_CONTEXTS = {}
 
 
 def run(cmd, check=True):
@@ -73,17 +75,6 @@ def run_for_output(cmd, check=True):
     return process
 
 
-def local_branch_exists(branch_name):
-    ref = f"refs/heads/{branch_name}"
-    process = subprocess.run(
-        "cd comma_openpilot && "
-        f"git show-ref --verify --quiet {shlex.quote(ref)}",
-        shell=True,
-        check=False,
-    )
-    return process.returncode == 0
-
-
 def is_transient_git_error(process):
     if process.returncode in TRANSIENT_GIT_RETURN_CODES:
         return True
@@ -93,6 +84,46 @@ def is_transient_git_error(process):
     return any(
         marker.lower() in normalized_output for marker in TRANSIENT_GIT_ERROR_MARKERS
     )
+
+
+def git_cmd(args):
+    return "git " + " ".join(shlex.quote(str(arg)) for arg in args)
+
+
+def git_capture(args, cwd="comma_openpilot", env=None):
+    logging.info("+ cd %s && %s", cwd, git_cmd(args))
+    return subprocess.check_output(
+        ["git", *args], cwd=cwd, env=env, text=True
+    ).strip()
+
+
+def git_capture_bytes(args, cwd="comma_openpilot", env=None):
+    logging.info("+ cd %s && %s", cwd, git_cmd(args))
+    return subprocess.check_output(["git", *args], cwd=cwd, env=env)
+
+
+def git_run(args, cwd="comma_openpilot", env=None):
+    logging.info("+ cd %s && %s", cwd, git_cmd(args))
+    return subprocess.run(["git", *args], cwd=cwd, env=env, check=True)
+
+
+def get_branch_context(upstream_branch):
+    if upstream_branch in BRANCH_CONTEXTS:
+        return BRANCH_CONTEXTS[upstream_branch]
+
+    base_ref = f"origin/{upstream_branch}"
+    launch_env_meta = git_capture(["ls-tree", base_ref, "launch_env.sh"])
+    context = {
+        "base_ref": base_ref,
+        "base_commit": git_capture(["rev-parse", base_ref]),
+        "base_tree": git_capture(["rev-parse", f"{base_ref}^{{tree}}"]),
+        "launch_env_mode": launch_env_meta.split()[0],
+        "launch_env": git_capture_bytes(["show", f"{base_ref}:launch_env.sh"]),
+        "commit_date": git_capture(["log", "-1", "--format=%cd", "--date=iso-strict", base_ref]),
+        "author_date": git_capture(["log", "-1", "--format=%ad", "--date=iso-strict", base_ref]),
+    }
+    BRANCH_CONTEXTS[upstream_branch] = context
+    return context
 
 
 def push_branch_with_retries(branch_name):
@@ -312,33 +343,60 @@ def generate_branch(base, upstream_branch, car):
     # Remove () because they are special characters and may cause issues
     branch_name = f"{base}-{sanitize_branch_component(car)}"
     logging.info("Generating branch %s from origin/%s", branch_name, upstream_branch)
-    if local_branch_exists(branch_name):
-        run(f"cd comma_openpilot && git branch -D {shlex.quote(branch_name)}")
-    # Make branch off of base branch
-    run(
-        "cd comma_openpilot && "
-        f"git checkout --force -B {shlex.quote(branch_name)} origin/{shlex.quote(upstream_branch)}"
-    )
-    # Make sure base branch is clean
-    run(
-        "cd comma_openpilot && "
-        f"git reset --hard origin/{shlex.quote(upstream_branch)}"
-    )
-    # Append 'export FINGERPRINT="car name"' to the end of launch_env.sh
-    with open("comma_openpilot/launch_env.sh", "a") as f:
-        f.write(f'\nexport FINGERPRINT="{car}"\n')
-    # Commit the changes
-    # Get date of current commit
-    commit_date = capture("cd comma_openpilot && git log -1 --format=%cd --date=iso-strict")
-    author_date = capture("cd comma_openpilot && git log -1 --format=%ad --date=iso-strict")
 
-    run(
-        "cd comma_openpilot && "
-        "git add launch_env.sh && "
-        f"GIT_AUTHOR_DATE={shlex.quote(author_date)} "
-        f"GIT_COMMITTER_DATE={shlex.quote(commit_date)} "
-        f"git commit -m {shlex.quote(f'Hardcode fingerprint for {car}')}"
-    )
+    branch_context = get_branch_context(upstream_branch)
+    base_commit = branch_context["base_commit"]
+    base_tree = branch_context["base_tree"]
+    launch_env_mode = branch_context["launch_env_mode"]
+    launch_env = branch_context["launch_env"]
+    launch_env += f'\nexport FINGERPRINT="{car}"\n'.encode()
+    # hash-object needs stdin; keep this separate so log output stays readable.
+    logging.info("+ cd comma_openpilot && git hash-object -w --stdin < launch_env.sh")
+    launch_env_blob = subprocess.check_output(
+        ["git", "hash-object", "-w", "--stdin"],
+        cwd="comma_openpilot",
+        input=launch_env,
+        text=False,
+    ).decode().strip()
+
+    commit_date = branch_context["commit_date"]
+    author_date = branch_context["author_date"]
+    index_file = tempfile.NamedTemporaryFile(prefix="hardcoded-fp-index-", delete=False)
+    index_file.close()
+
+    try:
+        env = os.environ.copy()
+        env["GIT_INDEX_FILE"] = index_file.name
+        git_run(["read-tree", base_tree], env=env)
+        git_run(
+            [
+                "update-index",
+                "--add",
+                "--cacheinfo",
+                f"{launch_env_mode},{launch_env_blob},launch_env.sh",
+            ],
+            env=env,
+        )
+        tree = git_capture(["write-tree"], env=env)
+
+        commit_env = env.copy()
+        commit_env["GIT_AUTHOR_DATE"] = author_date
+        commit_env["GIT_COMMITTER_DATE"] = commit_date
+        commit = git_capture(
+            [
+                "commit-tree",
+                tree,
+                "-p",
+                base_commit,
+                "-m",
+                f"Hardcode fingerprint for {car}",
+            ],
+            env=commit_env,
+        )
+        git_run(["update-ref", f"refs/heads/{branch_name}", commit])
+    finally:
+        os.unlink(index_file.name)
+
     return branch_name
 
 
