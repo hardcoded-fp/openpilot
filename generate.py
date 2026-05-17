@@ -36,6 +36,10 @@ TRANSIENT_GIT_ERROR_MARKERS = (
     "early EOF",
     "RPC failed",
 )
+TRANSIENT_GIT_RETURN_CODES = (
+    -15,  # SIGTERM when subprocess reports the signal directly.
+    143,  # 128 + SIGTERM when reported through the shell.
+)
 PUSH_RETRY_ATTEMPTS = 5
 PUSH_RETRY_BASE_DELAY_SECONDS = 10
 
@@ -80,7 +84,11 @@ def local_branch_exists(branch_name):
     return process.returncode == 0
 
 
-def is_transient_git_error(output):
+def is_transient_git_error(process):
+    if process.returncode in TRANSIENT_GIT_RETURN_CODES:
+        return True
+
+    output = process.stdout or ""
     normalized_output = output.lower()
     return any(
         marker.lower() in normalized_output for marker in TRANSIENT_GIT_ERROR_MARKERS
@@ -98,7 +106,7 @@ def push_branch_with_retries(branch_name):
             return
 
         output = process.stdout or ""
-        if not is_transient_git_error(output) or attempt == PUSH_RETRY_ATTEMPTS:
+        if not is_transient_git_error(process) or attempt == PUSH_RETRY_ATTEMPTS:
             raise subprocess.CalledProcessError(
                 process.returncode, process.args, output=output
             )
@@ -106,10 +114,11 @@ def push_branch_with_retries(branch_name):
         delay = PUSH_RETRY_BASE_DELAY_SECONDS * attempt
         logging.warning(
             "Push failed with a transient GitHub error. "
-            "Retrying in %s seconds (%s/%s).",
+            "Retrying in %s seconds (%s/%s). Return code: %s.",
             delay,
             attempt + 1,
             PUSH_RETRY_ATTEMPTS,
+            process.returncode,
         )
         time.sleep(delay)
 
