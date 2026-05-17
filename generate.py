@@ -43,6 +43,7 @@ TRANSIENT_GIT_RETURN_CODES = (
 )
 PUSH_RETRY_ATTEMPTS = 5
 PUSH_RETRY_BASE_DELAY_SECONDS = 10
+PUSH_BATCH_SIZE = 100
 BRANCH_CONTEXTS = {}
 
 
@@ -67,6 +68,25 @@ def run_for_output(cmd, check=True):
         stderr=subprocess.STDOUT,
     )
     if process.stdout:
+        logging.info(process.stdout.rstrip())
+    if check and process.returncode != 0:
+        raise subprocess.CalledProcessError(
+            process.returncode, process.args, output=process.stdout
+        )
+    return process
+
+
+def run_args_for_output(args, cwd=None, check=True, log_output=True):
+    logging.info("+ %s", " ".join(shlex.quote(str(arg)) for arg in args))
+    process = subprocess.run(
+        args,
+        cwd=cwd,
+        check=False,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+    )
+    if log_output and process.stdout:
         logging.info(process.stdout.rstrip())
     if check and process.returncode != 0:
         raise subprocess.CalledProcessError(
@@ -127,12 +147,14 @@ def get_branch_context(upstream_branch):
 
 
 def push_branch_with_retries(branch_name):
-    push_cmd = (
-        "cd comma_openpilot && "
-        f"git push origin --force {shlex.quote(branch_name)}:{shlex.quote(branch_name)}"
-    )
+    push_branch_batch_with_retries([branch_name])
+
+
+def push_branch_batch_with_retries(branch_names):
+    push_args = ["git", "push", "origin", "--force"]
+    push_args.extend(f"{branch_name}:{branch_name}" for branch_name in branch_names)
     for attempt in range(1, PUSH_RETRY_ATTEMPTS + 1):
-        process = run_for_output(push_cmd, check=False)
+        process = run_args_for_output(push_args, cwd="comma_openpilot", check=False)
         if process.returncode == 0:
             return
 
@@ -144,14 +166,57 @@ def push_branch_with_retries(branch_name):
 
         delay = PUSH_RETRY_BASE_DELAY_SECONDS * attempt
         logging.warning(
-            "Push failed with a transient GitHub error. "
+            "Push batch of %s branches failed with a transient GitHub error. "
             "Retrying in %s seconds (%s/%s). Return code: %s.",
+            len(branch_names),
             delay,
             attempt + 1,
             PUSH_RETRY_ATTEMPTS,
             process.returncode,
         )
         time.sleep(delay)
+
+
+def chunked(items, size):
+    for index in range(0, len(items), size):
+        yield items[index : index + size]
+
+
+def get_remote_branch_tips(branch_names):
+    remote_tips = {}
+    for batch in chunked(branch_names, PUSH_BATCH_SIZE):
+        patterns = [f"refs/heads/{branch_name}" for branch_name in batch]
+        process = run_args_for_output(
+            ["git", "ls-remote", "origin", *patterns],
+            cwd="comma_openpilot",
+            check=False,
+            log_output=False,
+        )
+        if process.returncode != 0:
+            raise subprocess.CalledProcessError(
+                process.returncode, process.args, output=process.stdout
+            )
+
+        for line in process.stdout.splitlines():
+            sha, ref = line.split("\t", 1)
+            remote_tips[ref.removeprefix("refs/heads/")] = sha
+    return remote_tips
+
+
+def get_local_branch_tips(branch_names):
+    local_tips = {}
+    for batch in chunked(branch_names, PUSH_BATCH_SIZE):
+        refs = [f"refs/heads/{branch_name}" for branch_name in batch]
+        output = git_capture(
+            ["for-each-ref", "--format=%(refname:short) %(objectname)", *refs]
+        )
+        if not output:
+            continue
+
+        for line in output.splitlines():
+            branch_name, sha = line.split(" ", 1)
+            local_tips[branch_name] = sha
+    return local_tips
 
 
 def get_available_upstream_branches():
@@ -533,9 +598,31 @@ def push_generated_branches(base_cars_base_branches):
         branch_names.extend(branches_by_car.values())
 
     unique_branch_names = sorted(set(branch_names))
-    for branch_name in unique_branch_names:
-        logging.info("Pushing branch %s", branch_name)
-        push_branch_with_retries(branch_name)
+    remote_tips = get_remote_branch_tips(unique_branch_names)
+    local_tips = get_local_branch_tips(unique_branch_names)
+    changed_branch_names = [
+        branch_name
+        for branch_name in unique_branch_names
+        if local_tips[branch_name] != remote_tips.get(branch_name)
+    ]
+    skipped_count = len(unique_branch_names) - len(changed_branch_names)
+
+    logging.info(
+        "Skipping %s unchanged generated branches. Pushing %s changed branches.",
+        skipped_count,
+        len(changed_branch_names),
+    )
+    for batch in chunked(changed_branch_names, PUSH_BATCH_SIZE):
+        logging.info("Pushing %s generated branches", len(batch))
+        try:
+            push_branch_batch_with_retries(batch)
+        except subprocess.CalledProcessError:
+            logging.warning(
+                "Batch push failed. Falling back to per-branch pushes for this batch."
+            )
+            for branch_name in batch:
+                logging.info("Pushing branch %s", branch_name)
+                push_branch_with_retries(branch_name)
 
 
 def main(push=True):
