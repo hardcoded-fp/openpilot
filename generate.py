@@ -555,16 +555,44 @@ const filterInput = document.getElementById("filter-input");
 const matchCount = document.getElementById("match-count");
 const sections = Array.from(document.querySelectorAll(".branch-section"));
 
-function applyFilter() {
-  const query = filterInput.value.trim().toLowerCase();
+function getQueryFromUrl() {
+  const searchParams = new URLSearchParams(window.location.search);
+  return searchParams.get("q") || "";
+}
+
+function updateSearchUrl(query) {
+  const url = new URL(window.location.href);
+
+  if (query === "") {
+    url.searchParams.delete("q");
+  } else {
+    url.searchParams.set("q", query);
+  }
+
+  if (url.href !== window.location.href) {
+    window.history.replaceState(null, "", url);
+  }
+}
+
+function normalizeSearchText(value) {
+  return value.trim().toLowerCase().replace(/[-_]+/g, " ").replace(/\\s+/g, " ");
+}
+
+function applyFilter(updateUrl = false) {
+  const rawQuery = filterInput.value.trim();
+  const query = normalizeSearchText(rawQuery);
   let totalVisible = 0;
+
+  if (updateUrl) {
+    updateSearchUrl(rawQuery);
+  }
 
   for (const section of sections) {
     const items = Array.from(section.querySelectorAll(".car-item"));
     let visibleInSection = 0;
 
     for (const item of items) {
-      const matches = query === "" || item.dataset.search.includes(query);
+      const matches = query === "" || normalizeSearchText(item.dataset.search).includes(query);
       item.hidden = !matches;
       if (matches) {
         visibleInSection += 1;
@@ -580,7 +608,12 @@ function applyFilter() {
     : `Showing ${totalVisible} matching generated branches.`;
 }
 
-filterInput.addEventListener("input", applyFilter);
+filterInput.value = getQueryFromUrl();
+filterInput.addEventListener("input", () => applyFilter(true));
+window.addEventListener("popstate", () => {
+  filterInput.value = getQueryFromUrl();
+  applyFilter();
+});
 applyFilter();
 </script>
 </body>
