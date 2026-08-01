@@ -307,7 +307,18 @@ def parse_cars(upstream_branch):
     # Checkout branch
     run(f"cd comma_openpilot && git checkout --force origin/{upstream_branch}")
 
-    car_root = "comma_openpilot/opendbc/car"
+    car_roots = (
+        "comma_openpilot/opendbc/car",
+        "comma_openpilot/opendbc_repo/opendbc/car",
+    )
+    car_root = next((root for root in car_roots if os.path.isdir(root)), None)
+    if car_root is None:
+        raise RuntimeError(
+            f"Could not find an opendbc car directory in {upstream_branch}: "
+            + ", ".join(car_roots)
+        )
+
+    logging.info("Using car definitions from %s", car_root)
     values_py_paths = []
     fingerprints_py_paths = []
     cars = []
